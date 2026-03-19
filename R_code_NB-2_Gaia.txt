@@ -1,0 +1,488 @@
+
+## 0. Setup ----
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(MASS)     
+  library(ggplot2)  
+  library(httr)
+})
+
+###########################
+
+library(httr)
+library(readr)
+
+tap_url <- "https://gea.esac.esa.int/tap-server/tap/sync"
+
+adql_query <- "
+SELECT
+  FLOOR(ra/5.0)  AS ra_bin_deg,
+  FLOOR(dec/5.0) AS dec_bin_deg,
+  COUNT(*)       AS n_stars
+FROM gaiadr3.gaia_source
+WHERE phot_g_mean_mag BETWEEN 10 AND 18
+GROUP BY 1, 2
+ORDER BY 1, 2
+"
+
+cat("Submitting ADQL query to Gaia TAP...\n")
+
+resp <- POST(
+  url   = tap_url,
+  body  = list(
+    REQUEST = "doQuery",
+    LANG    = "ADQL",
+    FORMAT  = "csv",
+    QUERY   = adql_query
+  ),
+  encode = "form"
+)
+
+# Check status
+sc <- status_code(resp)
+cat("HTTP status:", sc, "\n")
+
+if (sc != 200) {
+  cat("Gaia TAP returned HTTP status", sc, "\n")
+  cat("Server message:\n")
+  cat(content(resp, "text"), "\n")
+  stop("Gaia TAP query failed. See message above.")
+}
+
+# Save as CSV
+csv_file <- "gaia_counts.csv"
+writeBin(content(resp, "raw"), csv_file)
+cat("Saved Gaia counts to:", csv_file, "\n")
+
+
+## ---------------------------
+## 1) Libraries + settings
+## ---------------------------
+  library(readr)
+  library(dplyr)
+  library(MASS)     
+  library(ggplot2)  
+  library(httr)
+
+
+set.seed(12345)  
+
+## ---------------------------
+## 2) Load data from CSV
+## ---------------------------
+csv_path <- "gaia_counts.csv"
+gaia_counts <- read_csv(csv_path, show_col_types = FALSE)
+
+stopifnot(all(c("ra_bin_deg", "dec_bin_deg", "n_stars") %in% names(gaia_counts)))
+
+cat("Loaded:", csv_path, "\n")
+cat("Rows:", nrow(gaia_counts), "\n")
+
+## ---------------------------
+## 3) Bin midpoints + summaries
+## ---------------------------
+gaia_counts <- gaia_counts %>%
+  mutate(
+    ra_mid  = ra_bin_deg  * 5 + 2.5,
+    dec_mid = dec_bin_deg * 5 + 2.5
+  )
+
+y <- gaia_counts$n_stars
+n <- length(y)
+
+mean_count <- mean(y)
+var_count  <- var(y)
+vmr        <- var_count / mean_count
+
+cat("\nEmpirical summaries:\n")
+cat("Global mean   (mu_emp):", mean_count, "\n")
+cat("Global var    (S^2)   :", var_count, "\n")
+cat("Variance/mean (VMR)   :", vmr, "\n")
+
+## ---------------------------
+## 4) Intercept-only NB2 model
+##    + Wald CI + Profile CI
+## ---------------------------
+cat("\nFitting intercept-only NB2 model...\n")
+fit_nb2_int <- glm.nb(n_stars ~ 1, data = gaia_counts)
+
+beta0_hat     <- as.numeric(coef(fit_nb2_int)[1])
+V_beta0       <- as.numeric(vcov(fit_nb2_int)[1, 1])
+se_beta0      <- sqrt(V_beta0)
+
+mu_hat_int    <- exp(beta0_hat)
+theta_hat_int <- fit_nb2_int$theta
+LL_max_int    <- as.numeric(logLik(fit_nb2_int))
+
+cat("NB2 intercept-only: mu_hat =", mu_hat_int,
+    ", theta_hat =", theta_hat_int, "\n")
+
+## 4a) Wald 95% CI for GLOBAL mu (log-scale)
+z_975 <- qnorm(0.975)
+beta0_lo <- beta0_hat - z_975 * se_beta0
+beta0_hi <- beta0_hat + z_975 * se_beta0
+
+wald_mu_lo <- exp(beta0_lo)
+wald_mu_hi <- exp(beta0_hi)
+
+cat("\nWald 95% CI for GLOBAL mu (via log-scale beta0 CI):\n")
+print(c(mu_hat = mu_hat_int,
+        wald_lower = wald_mu_lo,
+        wald_upper = wald_mu_hi))
+
+## 4b) Profile likelihood CI for GLOBAL mu
+nb2_loglik_int <- function(mu, theta, y) {
+  if (mu <= 0 || theta <= 0) return(-Inf)
+  term1 <- lgamma(y + theta) - lgamma(theta) - lgamma(y + 1)
+  term2 <- theta * log(theta / (theta + mu))
+  term3 <- y * log(mu / (theta + mu))
+  sum(term1 + term2 + term3)
+}
+
+profile_theta_for_mu <- function(mu0, y, theta_start) {
+  fn_neg <- function(log_theta) {
+    theta <- exp(log_theta)
+    -nb2_loglik_int(mu0, theta, y)
+  }
+  opt <- optim(
+    par    = log(theta_start),
+    fn     = fn_neg,
+    method = "Brent",
+    lower  = log(1e-6),
+    upper  = log(1e6)
+  )
+  list(theta_hat_mu = exp(opt$par), loglik_mu = -opt$value)
+}
+
+dev_mu_int <- function(mu0, y, theta_start, LL_max) {
+  if (mu0 <= 0) return(Inf)
+  prof <- profile_theta_for_mu(mu0, y, theta_start = theta_start)
+  2 * (LL_max - prof$loglik_mu)
+}
+
+cutoff <- qchisq(0.95, df = 1)
+lower_fun_int <- function(mu0) dev_mu_int(mu0, y, theta_hat_int, LL_max_int) - cutoff
+upper_fun_int <- function(mu0) dev_mu_int(mu0, y, theta_hat_int, LL_max_int) - cutoff
+
+cat("\nComputing profile CI for GLOBAL mu...\n")
+ci_lower_int <- uniroot(lower_fun_int, lower = mu_hat_int * 1e-3, upper = mu_hat_int)$root
+ci_upper_int <- uniroot(upper_fun_int, lower = mu_hat_int,       upper = mu_hat_int * 1e3)$root
+
+cat("Profile 95% CI for GLOBAL mu:\n")
+print(c(mu_hat = mu_hat_int,
+        prof_lower = ci_lower_int,
+        prof_upper = ci_upper_int))
+
+## ---------------------------
+## 5) Parametric bootstrap CI for GLOBAL mu
+## ---------------------------
+cat("\nParametric bootstrap CI for GLOBAL mu (NB2, intercept-only)...\n")
+B_mu <- 10000
+mu_boot <- numeric(B_mu)
+
+for (b in seq_len(B_mu)) {
+  y_boot <- rnbinom(n, size = theta_hat_int, mu = mu_hat_int)
+  fit_boot <- try(glm.nb(y_boot ~ 1), silent = TRUE)
+  mu_boot[b] <- if (inherits(fit_boot, "try-error")) NA_real_ else exp(coef(fit_boot)[1])
+}
+mu_boot <- mu_boot[is.finite(mu_boot)]
+boot_ci_mu <- quantile(mu_boot, probs = c(0.025, 0.975), na.rm = TRUE)
+
+cat("Bootstrap percentile 95% CI for GLOBAL mu:\n")
+print(c(mu_hat = mu_hat_int,
+        boot_lower = boot_ci_mu[1],
+        boot_upper = boot_ci_mu[2]))
+
+## ---------------------------
+## 6) Convert RA/Dec -> Galactic l,b and |b|
+## ---------------------------
+cat("\nConverting (RA, Dec) to Galactic (l, b)...\n")
+
+radec_to_gal <- function(ra_deg, dec_deg) {
+  d2r <- pi / 180
+  ra  <- ra_deg  * d2r
+  dec <- dec_deg * d2r
+
+  x_eq <- cos(dec) * cos(ra)
+  y_eq <- cos(dec) * sin(ra)
+  z_eq <- sin(dec)
+
+  ## IAU rotation matrix (J2000 equatorial -> Galactic)
+  R <- matrix(c(
+    -0.0548755604162154, -0.8734370902348850, -0.4838350155487132,
+     0.4941094278755837, -0.4448296299600112,  0.7469822444972189,
+    -0.8676661490190047, -0.1980763734312015,  0.4559837761750669
+  ), nrow = 3, byrow = TRUE)
+
+  x_gal <- R[1,1] * x_eq + R[1,2] * y_eq + R[1,3] * z_eq
+  y_gal <- R[2,1] * x_eq + R[2,2] * y_eq + R[2,3] * z_eq
+  z_gal <- R[3,1] * x_eq + R[3,2] * y_eq + R[3,3] * z_eq
+
+  b_rad <- asin(z_gal)
+  l_rad <- atan2(y_gal, x_gal)
+  l_rad <- ifelse(l_rad < 0, l_rad + 2*pi, l_rad)
+
+  data.frame(l = l_rad / d2r, b = b_rad / d2r)
+}
+
+gal_coords <- radec_to_gal(gaia_counts$ra_mid, gaia_counts$dec_mid)
+gaia_counts$l     <- gal_coords$l
+gaia_counts$b     <- gal_coords$b
+gaia_counts$abs_b <- abs(gaia_counts$b)
+
+cat("Sanity check b range:\n")
+print(summary(gaia_counts$b))
+
+## ---------------------------
+## 7) Diagnostics: counts vs |b| bands + plot
+## ---------------------------
+cat("\nSummarizing counts by |b| bands...\n")
+
+gaia_counts$b_band <- cut(
+  gaia_counts$abs_b,
+  breaks = seq(0, 90, by = 5),
+  include.lowest = TRUE,
+  right = FALSE
+)
+
+band_summary <- aggregate(
+  n_stars ~ b_band,
+  data = gaia_counts,
+  FUN = function(z) c(mean = mean(z), median = median(z))
+)
+
+band_summary$mean_count   <- band_summary$n_stars[, "mean"]
+band_summary$median_count <- band_summary$n_stars[, "median"]
+band_summary$n_stars <- NULL
+
+print(band_summary)
+
+cor_absb <- cor(gaia_counts$abs_b, gaia_counts$n_stars, method = "spearman")
+cat("\nSpearman correlation(|b|, n_stars) =", cor_absb, "\n")
+
+## Plot 1: mean counts vs |b| (log y)
+band_summary$band_mid <- seq(2.5, 87.5, by = 5)[seq_len(nrow(band_summary))]
+
+p1 <- ggplot(band_summary, aes(x = band_mid, y = mean_count)) +
+  geom_point(size = 1.8) +
+  geom_line() +
+  scale_y_log10() +
+  labs(
+    x = "|b| (deg, band midpoints)",
+    y = "Mean star count per 5°×5° bin (log10 scale)",
+    title = "Gaia DR3 star counts vs distance from Galactic plane"
+  ) +
+  theme_bw()
+
+ggsave("fig_gaia_counts_vs_b.pdf", p1, width = 7, height = 5)
+cat("\nSaved: fig_gaia_counts_vs_b.pdf\n")
+
+## ---------------------------
+## 8) NB2 regression vs Poisson: n_stars ~ abs_b
+## ---------------------------
+cat("\nFitting NB2 regression: n_stars ~ abs_b ...\n")
+fit_nb2_reg <- glm.nb(n_stars ~ abs_b, data = gaia_counts)
+print(summary(fit_nb2_reg))
+
+cat("\nFitting Poisson regression for comparison...\n")
+fit_pois_reg <- glm(n_stars ~ abs_b, family = poisson, data = gaia_counts)
+
+cat("\nAIC comparison (smaller is better):\n")
+print(AIC(fit_pois_reg, fit_nb2_reg))
+
+beta_hat_reg  <- coef(fit_nb2_reg)
+theta_hat_reg <- fit_nb2_reg$theta
+LL_max_reg    <- as.numeric(logLik(fit_nb2_reg))
+
+b_vals <- c(0, 10, 30, 60)
+mu_hat_b <- predict(fit_nb2_reg, newdata = data.frame(abs_b = b_vals), type = "response")
+
+cat("\nFitted mean counts at |b| = 0, 10, 30, 60 deg:\n")
+print(data.frame(abs_b = b_vals, mu_hat = mu_hat_b))
+
+## ---------------------------
+## 9) Wald CI for mu(b0) in regression (log-scale)
+## ---------------------------
+b0 <- 0  # Galactic plane
+x0 <- c(1, abs(b0))
+V_beta <- vcov(fit_nb2_reg)
+
+eta_hat_b0 <- sum(x0 * beta_hat_reg)
+mu_hat_b0  <- exp(eta_hat_b0)
+
+var_eta_b0 <- as.numeric(t(x0) %*% V_beta %*% x0)
+se_eta_b0  <- sqrt(var_eta_b0)
+
+wald_lower_b0 <- exp(eta_hat_b0 - z_975 * se_eta_b0)
+wald_upper_b0 <- exp(eta_hat_b0 + z_975 * se_eta_b0)
+
+cat("\nWald 95% CI for mu(b0) at b0 =", b0, "deg (log-scale CI):\n")
+print(c(mu_hat_b0 = mu_hat_b0,
+        wald_lower = wald_lower_b0,
+        wald_upper = wald_upper_b0))
+
+## ---------------------------
+## 10) Profile likelihood CI for mu(b0) in regression
+## ---------------------------
+cat("\nComputing profile likelihood CI for mu(b0) at b0 =", b0, "deg...\n")
+
+nb2_loglik_reg_full <- function(beta0, beta1, theta, y, abs_b) {
+  if (theta <= 0) return(-Inf)
+  eta <- beta0 + beta1 * abs_b
+  mu  <- exp(eta)
+  if (any(!is.finite(mu))) return(-Inf)
+
+  term1 <- lgamma(y + theta) - lgamma(theta) - lgamma(y + 1)
+  term2 <- theta * log(theta / (theta + mu))
+  term3 <- y * log(mu / (theta + mu))
+  sum(term1 + term2 + term3)
+}
+
+profile_loglik_mu_reg <- function(mu0, b0, y, abs_b, beta1_start, theta_start) {
+  if (mu0 <= 0) return(list(loglik_mu = -Inf))
+
+  fn_neg <- function(par) {
+    beta1 <- par[1]
+    theta <- exp(par[2])
+    beta0 <- log(mu0) - beta1 * abs(b0)  # constraint so that mu(b0)=mu0
+    -nb2_loglik_reg_full(beta0, beta1, theta, y, abs_b)
+  }
+
+  opt <- optim(
+    par = c(beta1_start, log(theta_start)),
+    fn = fn_neg,
+    method = "BFGS"
+  )
+
+  list(loglik_mu = -opt$value, convergence = opt$convergence)
+}
+
+dev_mu_reg <- function(mu0, b0) {
+  prof <- profile_loglik_mu_reg(
+    mu0, b0, y, gaia_counts$abs_b,
+    beta1_start = beta_hat_reg[2],
+    theta_start = theta_hat_reg
+  )
+  if (!is.finite(prof$loglik_mu)) return(Inf)
+  2 * (LL_max_reg - prof$loglik_mu)
+}
+
+cutoff_reg <- qchisq(0.95, df = 1)
+lower_fun_reg <- function(mu0) dev_mu_reg(mu0, b0) - cutoff_reg
+upper_fun_reg <- function(mu0) dev_mu_reg(mu0, b0) - cutoff_reg
+
+ci_lower_b0_prof <- uniroot(lower_fun_reg, lower = mu_hat_b0 * 1e-2, upper = mu_hat_b0)$root
+ci_upper_b0_prof <- uniroot(upper_fun_reg, lower = mu_hat_b0,       upper = mu_hat_b0 * 1e2)$root
+
+cat("Profile 95% CI for mu(b0) at b0 =", b0, "deg:\n")
+print(c(mu_hat_b0 = mu_hat_b0,
+        prof_lower = ci_lower_b0_prof,
+        prof_upper = ci_upper_b0_prof))
+
+## ---------------------------
+## 11) Parametric bootstrap CI for mu(b0) in regression
+## ---------------------------
+cat("\nParametric bootstrap CI for mu(b0) at b0 =", b0, "deg...\n")
+
+B_b0 <- 10000
+mu_b0_boot <- numeric(B_b0)
+
+mu_hat_vec <- fitted(fit_nb2_reg)
+
+for (b in seq_len(B_b0)) {
+  y_boot <- rnbinom(n, size = theta_hat_reg, mu = mu_hat_vec)
+  fit_boot <- try(glm.nb(y_boot ~ gaia_counts$abs_b), silent = TRUE)
+  mu_b0_boot[b] <- if (inherits(fit_boot, "try-error")) NA_real_ else exp(coef(fit_boot)[1])
+}
+
+mu_b0_boot <- mu_b0_boot[is.finite(mu_b0_boot)]
+boot_ci_b0 <- quantile(mu_b0_boot, probs = c(0.025, 0.975), na.rm = TRUE)
+
+cat("Bootstrap percentile 95% CI for mu(b0) at b0 =", b0, "deg:\n")
+print(c(mu_hat_b0 = mu_hat_b0,
+        boot_lower = boot_ci_b0[1],
+        boot_upper = boot_ci_b0[2]))
+
+## ---------------------------
+## 12) Mollweide sky heatmap in Galactic coordinates
+## ---------------------------
+cat("\nCreating Mollweide all-sky density heatmap (Galactic coords)...\n")
+
+## Mollweide projection helper (base-R; no extra packages)
+mollweide <- function(lon_deg, lat_deg) {
+  lon <- lon_deg * pi/180
+  lat <- lat_deg * pi/180
+
+  ## wrap longitude to [-pi, pi]
+  lon <- (lon + pi) %% (2*pi) - pi
+
+  theta <- lat
+  for (k in 1:10) {
+    theta <- theta - (2*theta + sin(2*theta) - pi*sin(lat)) / (2 + 2*cos(2*theta))
+  }
+  x <- (2*sqrt(2)/pi) * lon * cos(theta)
+  y <- sqrt(2) * sin(theta)
+  cbind(x = x, y = y)
+}
+
+## Use Galactic lon/lat bin centers derived from RA/Dec midpoints
+## For a map, it’s nicer to fold lon to [-180, 180] with l=0 at center:
+l_centered <- gaia_counts$l
+l_centered <- (l_centered + 180) %% 360 - 180
+
+xy <- mollweide(l_centered, gaia_counts$b)
+
+map_df <- data.frame(
+  x = xy[, "x"],
+  y = xy[, "y"],
+  log10_n = log10(gaia_counts$n_stars)
+)
+
+p2 <- ggplot(map_df, aes(x = x, y = y, fill = log10_n)) +
+  geom_point(shape = 15, size = 2) +
+  coord_equal() +
+  labs(
+    x = NULL, y = NULL,
+    fill = expression(log[10]~N),
+    title = "Gaia DR3 star density in Galactic coordinates (Mollweide projection)"
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  )
+
+ggsave("gaia_mollweide_galactic_density.pdf", p2, width = 10, height = 5.5)
+cat("Saved: gaia_mollweide_galactic_density.pdf\n")
+
+## ---------------------------
+## 13) Final summary 
+## ---------------------------
+cat("\n================ SUMMARY (copy to paper) ================\n")
+cat("N bins:", n, "\n")
+cat("Empirical mean:", mean_count, "\n")
+cat("Empirical variance:", var_count, "\n")
+cat("VMR:", vmr, "\n\n")
+
+cat("GLOBAL mu (NB2 intercept-only):\n")
+cat("  mu_hat =", mu_hat_int, "\n")
+cat("  theta_hat =", theta_hat_int, "\n")
+cat("  Wald 95% CI:", wald_mu_lo, ",", wald_mu_hi, "\n")
+cat("  Profile 95% CI:", ci_lower_int, ",", ci_upper_int, "\n")
+cat("  Bootstrap 95% CI:", boot_ci_mu[1], ",", boot_ci_mu[2], "\n\n")
+
+cat("Regression mu(b0) at b0=0 deg:\n")
+cat("  mu_hat =", mu_hat_b0, "\n")
+cat("  Wald 95% CI:", wald_lower_b0, ",", wald_upper_b0, "\n")
+cat("  Profile 95% CI:", ci_lower_b0_prof, ",", ci_upper_b0_prof, "\n")
+cat("  Bootstrap 95% CI:", boot_ci_b0[1], ",", boot_ci_b0[2], "\n\n")
+
+cat("Figures written:\n")
+cat("  - fig_gaia_counts_vs_b.pdf\n")
+cat("  - gaia_mollweide_galactic_density.pdf\n")
+cat("=========================================================\n")
+
+cat("\nAll calculations complete.\n")
